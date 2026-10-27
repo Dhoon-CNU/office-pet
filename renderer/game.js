@@ -1,0 +1,551 @@
+/* 사무실 펫 — 게임 로직 */
+(function () {
+  'use strict';
+  const SPR = window.Sprites;
+
+  /* ===== 설정값 (숫자만 바꿔서 밸런스 조정) ===== */
+  const CFG = {
+    WORK_START: 9, WORK_END: 18,                       // 근무시간 (평일)
+    STAGE_MIN: { egg: 1080, baby: 1080, child: 1620 }, // 단계별 근무시간(분): 알 2일, 아기 2일, 어린이 3일
+    FAST: 5,                                           // 빠른 모드: 실제 1초 = 근무 5분
+    NEGLECT: 8,                                        // 알 단계 돌봄 횟수가 이보다 적으면 먼지뭉치
+    COOLDOWN: 60000,                                   // 알 단계 돌봄 집계 간격(ms)
+    DECAY: { full: 0.42, mood: 0.28, energy: 0.19 },   // 근무 1분당 감소량
+    SLEEP: { energy: 0.6, full: 0.2 },
+    POMO: { focus: 25, brk: 5 },                       // 뽀모도로(분)
+    SPEED: { baby: 26, child: 34, adult: 40 }          // 걷는 속도(px/초)
+  };
+  const NEXT = { egg: 'baby', baby: 'child', child: 'adult' };
+  const STAGE_KO = { egg: '알', baby: '아기', child: '어린이', adult: '어른' };
+  const SC = 5, OY = 5;
+
+  /* ===== 프로그램 연결 (브라우저로 열면 미리보기 모드) ===== */
+  const api = window.officePet || {
+    load: async () => { try { return JSON.parse(localStorage.getItem('officePet.v2')); } catch (e) { return null; } },
+    save: async d => { try { localStorage.setItem('officePet.v2', JSON.stringify(d)); } catch (e) { } },
+    saveSync: d => { try { localStorage.setItem('officePet.v2', JSON.stringify(d)); } catch (e) { } },
+    setIgnore() { }, walk: async () => ({}), dragStart() { }, dragEnd: async () => { }, snapBottom: async () => { },
+    hide() { }, setMode() { }, getAutostart: async () => false, setAutostart: async () => false,
+    version: async () => '미리보기', checkUpdate() { }, on() { }
+  };
+
+  /* ===== 상태 ===== */
+  const pad = n => String(n).padStart(2, '0');
+  const dayKey = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  const today = () => dayKey(new Date());
+  const freshEgg = () => ({ prog: 0, feed: 0, play: 0, rest: 0, poke: 0, last: {} });
+  function fresh() {
+    return {
+      v: 2, stage: 'egg', species: null, egg: freshEgg(), stats: { full: 70, mood: 70, energy: 80 },
+      sleeping: false, stageMin: 0, dex: {}, fast: false, mode: 'walk', dayOff: null,
+      todos: [], pomo: { state: 'idle', until: 0 }, count: { todo: 0, pomo: 0 }, daily: { day: today(), todo: 0, pomo: 0 },
+      last: Date.now()
+    };
+  }
+  let S = null;
+  function save() { if (S) api.save(JSON.parse(JSON.stringify(S))); }
+
+  /* ===== 시간 ===== */
+  function workMin(a, b) {
+    if (b <= a) return 0;
+    a = Math.max(a, b - 14 * 864e5);
+    let tot = 0; const d = new Date(a); d.setHours(0, 0, 0, 0);
+    while (d.getTime() < b) {
+      const w = d.getDay();
+      if (w >= 1 && w <= 5 && dayKey(d) !== S.dayOff) {
+        const s = new Date(d); s.setHours(CFG.WORK_START, 0, 0, 0);
+        const e = new Date(d); e.setHours(CFG.WORK_END, 0, 0, 0);
+        const o = Math.min(b, e.getTime()) - Math.max(a, s.getTime());
+        if (o > 0) tot += o;
+      }
+      d.setDate(d.getDate() + 1);
+    }
+    return tot / 6e4;
+  }
+  function isWork() {
+    if (S.fast) return true;
+    const d = new Date(), w = d.getDay(), h = d.getHours();
+    return w >= 1 && w <= 5 && h >= CFG.WORK_START && h < CFG.WORK_END && S.dayOff !== today();
+  }
+  function offReason() {
+    const w = new Date().getDay();
+    if (S.dayOff === today()) return '오늘은 휴무… zZ';
+    return (w === 0 || w === 6) ? '주말이야… zZ' : '퇴근했어… zZ';
+  }
+  function leaveText() {
+    const d = new Date(), w = d.getDay();
+    if (S.fast) return '빠른 모드 (테스트 중)';
+    if (S.dayOff === today()) return '오늘은 휴무';
+    if (w === 0 || w === 6) return '주말';
+    const now = d.getHours() * 60 + d.getMinutes();
+    if (now < CFG.WORK_START * 60) return '출근 전';
+    if (now >= CFG.WORK_END * 60) return '퇴근 완료';
+    const m = CFG.WORK_END * 60 - now;
+    return '퇴근까지 ' + Math.floor(m / 60) + '시간 ' + (m % 60) + '분';
+  }
+
+  /* ===== 부화 분기 ===== */
+  function decide(ignoreNeglect) {
+    const e = S.egg, t = e.feed + e.play + e.rest, all = t + e.poke;
+    if (!ignoreNeglect && all < CFG.NEGLECT) return 'mungi';
+    if (t > 0 && e.feed / t >= 0.5) return 'tteok';
+    if (e.poke >= t && all > 0) return 'dubu';
+    if (t === 0) return 'mungi';
+    return 'ssak';
+  }
+  function eggHint() {
+    const e = S.egg, all = e.feed + e.play + e.rest + e.poke, p = e.prog / CFG.STAGE_MIN.egg;
+    if (all < 3 && p < 0.5) return 'neutral';
+    return decide(p < 0.5);
+  }
+
+  /* ===== 진행 ===== */
+  let anim = { type: null, until: 0 }, hatching = false;
+  const play = (type, ms) => { anim = { type, until: performance.now() + ms }; };
+  function clampStats() { const st = S.stats; for (const k of ['full', 'mood', 'energy']) st[k] = Math.max(0, Math.min(100, st[k])); }
+  function advance(dm) {
+    if (S.stage === 'egg') {
+      S.egg.prog += dm;
+      if (S.egg.prog >= CFG.STAGE_MIN.egg && !hatching) startHatch();
+      return;
+    }
+    const st = S.stats;
+    if (S.sleeping) {
+      st.energy += dm * CFG.SLEEP.energy; st.full -= dm * CFG.SLEEP.full;
+      if (st.energy >= 100) { st.energy = 100; S.sleeping = false; say('잘 잤다!'); }
+    } else {
+      st.full -= dm * CFG.DECAY.full; st.mood -= dm * CFG.DECAY.mood; st.energy -= dm * CFG.DECAY.energy;
+      if (st.full < 20) st.mood -= dm * 0.2;
+      if (st.energy <= 0) { st.energy = 0; S.sleeping = true; say('기운이 없어서 잠들었어'); }
+    }
+    clampStats();
+    if (S.stage !== 'adult') {
+      const rate = (st.full < 20 || st.mood < 20) ? 0.5 : 1;
+      S.stageMin += dm * rate;
+      if (S.stageMin >= CFG.STAGE_MIN[S.stage]) evolve();
+    }
+  }
+  function startHatch() {
+    hatching = true; play('hatch', 2600); say('어? 알이 흔들려…!', 2600);
+    setTimeout(() => {
+      const sp = decide(false);
+      Object.assign(S, { stage: 'baby', species: sp, stats: { full: 70, mood: 75, energy: 80 }, sleeping: false, stageMin: 0 });
+      S.dex[sp] = S.dex[sp] || { first: Date.now(), adult: false };
+      hatching = false; play('joy', 1800); say(SPR.META[sp].born, 3500); save(); renderPanel();
+    }, 2600);
+  }
+  function evolve() {
+    S.stage = NEXT[S.stage]; S.stageMin = 0;
+    play('evolve', 1400);
+    if (S.stage === 'adult') { S.dex[S.species].adult = true; say('다 컸어! 이제 어른이야 (도감에 ★ 등록)', 4500); }
+    else say('쑥 자랐어! 이제 어린이야', 3500);
+    save(); renderPanel();
+  }
+
+  /* ===== 돌보기 ===== */
+  function canCount(k) { const now = Date.now(), cd = S.fast ? 3000 : CFG.COOLDOWN; if (now - (S.egg.last[k] || 0) >= cd) { S.egg.last[k] = now; return true; } return false; }
+  function act(k) {
+    if (!isWork()) { say('지금은 쉬는 시간이야 (평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시)'); return; }
+    if (hatching) return;
+    if (S.stage === 'egg') {
+      if (canCount(k)) S.egg[k]++;
+      say({ feed: '알이 따뜻해진 것 같아', play: '알이 살짝 흔들렸어!', rest: '포근하게 덮어줬어' }[k]);
+      play('wobble', 600);
+    } else {
+      const st = S.stats;
+      if (k === 'feed') {
+        if (S.sleeping) { say('자는 중이야…'); return; }
+        if (st.full > 90) { say('배불러…'); st.mood -= 3; }
+        else { st.full += 35; st.mood += 5; say('냠냠!'); play('eat', 2000); }
+      } else if (k === 'play') {
+        if (S.sleeping) { say('자는 중이야…'); return; }
+        if (st.energy < 15) { say('너무 졸려…'); return; }
+        st.mood += 25; st.energy -= 8; st.full -= 5; say('신난다!'); play('play', 2200);
+      } else if (k === 'rest') {
+        S.sleeping = !S.sleeping; say(S.sleeping ? '잘 자~ zZ' : '일어났어!');
+      }
+      clampStats();
+    }
+    save(); renderPanel();
+  }
+  function poke() {
+    if (hatching) return;
+    if (S.stage === 'egg') {
+      if (!isWork()) { say('알도 쉬는 중… zZ'); return; }
+      if (canCount('poke')) S.egg.poke++;
+      say(['톡톡…', '안에서 뭔가 움직여', '따뜻하다'][Math.floor(Math.random() * 3)]);
+      play('wobble', 600); save(); return;
+    }
+    if (!isWork()) { say(offReason()); return; }
+    if (S.sleeping) { say('zZ… (자는 중)'); return; }
+    if (S.pomo.state === 'focus') { say(['집중 중이야!', '조금만 더!', '타닥타닥…'][Math.floor(Math.random() * 3)]); return; }
+    const pool = ['헤헤', '왜~?', '일 잘 돼?', '같이 힘내자'].concat(SPR.META[S.species].lines);
+    S.stats.mood = Math.min(100, S.stats.mood + 2);
+    say(pool[Math.floor(Math.random() * pool.length)]);
+    play('joy', 1400); save();
+  }
+  function reward(mood, msg) {
+    if (S.stage !== 'egg') { S.stats.mood += mood; clampStats(); play('joy', 1600); }
+    else play('wobble', 600);
+    say(msg);
+  }
+
+  /* ===== 할 일 ===== */
+  function rollDaily() {
+    if (S.daily.day !== today()) S.daily = { day: today(), todo: 0, pomo: 0 };
+    const t = today(), before = S.todos.length;
+    S.todos = S.todos.filter(x => !x.done || x.doneDay === t);
+    return before !== S.todos.length;
+  }
+  function addTodo(text) {
+    text = (text || '').trim(); if (!text) return false;
+    S.todos.push({ id: Date.now() + Math.random(), t: text.slice(0, 60), done: false, doneDay: null });
+    save(); return true;
+  }
+  function toggleTodo(id, on) {
+    const it = S.todos.find(x => String(x.id) === String(id)); if (!it) return;
+    it.done = on; it.doneDay = on ? today() : null;
+    if (on) { S.count.todo++; S.daily.todo++; reward(10, ['수고했어!', '하나 끝! 멋지다', '착착 해내는 중'][Math.floor(Math.random() * 3)]); }
+    save();
+  }
+  function delTodo(id) { S.todos = S.todos.filter(x => String(x.id) !== String(id)); save(); }
+
+  /* ===== 뽀모도로 ===== */
+  const pomoDur = k => CFG.POMO[k] * (S.fast ? 1000 : 60000);
+  function pomoStart() { S.pomo = { state: 'focus', until: Date.now() + pomoDur('focus') }; say('집중 시작! 같이 일하자', 2500); save(); }
+  function pomoStop() { S.pomo = { state: 'idle', until: 0 }; say('타이머를 멈췄어'); save(); }
+  function pomoTick(now) {
+    const p = S.pomo;
+    if (p.state === 'focus' && now >= p.until) {
+      S.count.pomo++; S.daily.pomo++;
+      S.pomo = { state: 'break', until: now + pomoDur('brk') };
+      if (S.stage !== 'egg') { S.stats.energy -= 5; }
+      reward(15, '집중 끝! ' + CFG.POMO.brk + '분 쉬자'); save();
+    } else if (p.state === 'break' && now >= p.until) {
+      S.pomo = { state: 'idle', until: 0 }; say('쉬는 시간 끝! 다시 달려볼까?', 4000); save();
+    }
+  }
+  function mmss(ms) { const s = Math.max(0, Math.ceil(ms / 1000)); return pad(Math.floor(s / 60)) + ':' + pad(s % 60); }
+
+  /* ===== 알림 ===== */
+  const notified = {};
+  const TIPS = ['물 한 잔 마실 시간!', '어깨 한번 쭉 펴기~', '눈 좀 쉬어주자', '잠깐 일어나서 스트레칭!'];
+  function noticeTick() {
+    if (S.fast || !isWork() && new Date().getHours() !== CFG.WORK_END) return;
+    const d = new Date(), w = d.getDay(); if (w === 0 || w === 6 || S.dayOff === today()) return;
+    const h = d.getHours(), m = d.getMinutes(), key = today() + '-' + h + '-' + m;
+    if (notified[key]) return;
+    if (h === CFG.WORK_END - 1 && m === 50) { notified[key] = 1; say('퇴근 10분 전!', 5000); }
+    else if (h === CFG.WORK_END && m === 0) { notified[key] = 1; play('joy', 2000); say('퇴근 시간이다! 오늘도 수고했어', 6000); }
+    else if (m === 0 && h > CFG.WORK_START && h < CFG.WORK_END && h !== 12) { notified[key] = 1; say(TIPS[Math.floor(Math.random() * TIPS.length)], 4000); }
+  }
+
+  /* ===== 매초 ===== */
+  function tick() {
+    const now = Date.now();
+    const dm = S.fast ? (now - S.last) / 1000 * CFG.FAST : workMin(S.last, now);
+    S.last = now;
+    if (dm > 0 && !hatching) advance(dm);
+    pomoTick(now);
+    noticeTick();
+    if (rollDaily() && panelOpen && view === 'todo') renderPanel();
+    if (panelOpen) liveRefresh();
+  }
+
+  /* ===== 말풍선 ===== */
+  const bub = document.getElementById('bubble'); let bubT = 0, lastMsg = '';
+  function say(txt, ms) {
+    ms = ms || 2600; lastMsg = txt;
+    const pm = document.getElementById('pmsg');
+    if (panelOpen && pm) { pm.textContent = txt; return; }
+    bub.textContent = txt; bub.classList.add('on');
+    clearTimeout(bubT); bubT = setTimeout(() => bub.classList.remove('on'), ms);
+  }
+
+  /* ===== 그리기 ===== */
+  const cv = document.getElementById('pet'), ctx = cv.getContext('2d');
+  function px(c, x, y, col, sc) { sc = sc || SC; c.fillStyle = col; c.fillRect(x * sc, y * sc, sc, sc); }
+  function blit(c, g, dx, dy, over, sc) { for (let y = 0; y < 24; y++) for (let x = 0; x < 24; x++) { const v = g[y][x]; if (v) px(c, x + dx, y + dy, over || v, sc); } }
+  function pat(c, p, x0, y0, map) { p.forEach((row, r) => { for (let x = 0; x < row.length; x++) { const k = row[x]; if (k !== '.' && map[k]) px(c, x0 + x, y0 + r, map[k]); } }); }
+  const HEART = ['.o.o.', 'ooooo', '.ooo.', '..o..'], ZZZ = ['oooo', '..o.', '.o..', 'oooo'], DROP = ['.o', 'oo'];
+  const RICE = ['..oo..', '.owwo.', 'owwwwo', 'owwwwo', 'onnnno', '.oooo.'], BALL = ['.rr.', 'rwrr', 'rrrr', '.rr.'];
+  const LAPTOP = ['..kkkkkkkk..', '..kssssssk..', '..kssssssk..', '..kkkkkkkk..', 'kkkkkkkkkkkk', '.kkkkkkkkkk.'];
+  const SPARK = ['.o.', 'ooo', '.o.'];
+  function shadow(w) { ctx.fillStyle = 'rgba(0,0,0,0.13)'; ctx.fillRect((12 - w) * SC, (OY + 23) * SC, w * 2 * SC, SC); }
+
+  function drawEgg(t) {
+    const hint = eggHint(), g = SPR.EGG[hint];
+    let dx = 0;
+    if (anim.type === 'hatch') dx = Math.floor(t / 60) % 2 ? 1 : -1;
+    else if (anim.type === 'wobble' && t < anim.until) dx = Math.floor(t / 80) % 2 ? 1 : -1;
+    else if (isWork() && (t % 3000) < 300) dx = Math.floor(t / 90) % 2 ? 1 : -1;
+    shadow(6);
+    const flash = anim.type === 'hatch' && t > anim.until - 350;
+    blit(ctx, g, dx, OY, flash ? '#FFFFFF' : null);
+    const p = S.egg.prog / CFG.STAGE_MIN.egg, o = SPR.EGGP[hint].o;
+    if (p >= 0.8 && !flash) [[8, 11], [9, 12], [10, 11], [11, 12], [12, 11], [13, 12], [14, 11], [15, 12]].forEach(([x, y]) => px(ctx, x + dx, y + OY, o));
+    if (p >= 0.95 && !flash) [[10, 13], [14, 13], [12, 10]].forEach(([x, y]) => px(ctx, x + dx, y + OY, o));
+    if (!isWork()) pat(ctx, ZZZ, 18, 3 - Math.floor(t / 700) % 3, { o: '#8A93B8' });
+  }
+
+  function drawPet(t) {
+    const sp = SPR.SPR[S.species][S.stage], meta = SPR.META[S.species], st = S.stats, work = isWork();
+    const a = (anim.type && t < anim.until) ? anim.type : null;
+    let eyes = 'open', mouth = 'smile', dy = 0, fx = null, feet = 'stand', fo = 0, laptop = false;
+    if (dragging) { eyes = 'open'; mouth = 'o'; feet = 'dangle'; }
+    else if (!work || S.sleeping) { eyes = 'sleep'; mouth = 'flat'; dy = (Math.floor(t / 1100) % 2) ? 1 : 0; fx = 'zzz'; feet = 'none'; }
+    else if (a === 'joy' || a === 'play') { eyes = 'joy'; mouth = 'open'; const q = [0, -1, -3, -4, -3, -1]; dy = q[Math.floor(t / 85) % q.length]; fx = a === 'play' ? 'ball' : 'heart'; }
+    else if (a === 'eat') { mouth = (Math.floor(t / 180) % 2) ? 'open' : 'flat'; fx = 'rice'; dy = (Math.floor(t / 180) % 2) ? 0 : -1; }
+    else if (S.pomo.state === 'focus') { mouth = 'flat'; laptop = true; feet = 'none'; if ((t % 7000) < 900) fx = 'drop'; }
+    else if (st.full < 30) { eyes = 'teary'; mouth = 'wavy'; dy = 1; fx = 'drop'; }
+    else if (st.energy < 25) { eyes = 'tired'; mouth = 'flat'; dy = 1; }
+    else if (st.mood < 30) { mouth = 'frown'; }
+    else if (walking) { feet = 'walk'; dy = (Math.floor(t / 160) % 2) ? -1 : 0; fo = S.stage === 'baby' ? 0 : beh.dir; }
+    else {
+      dy = (Math.floor(t / 600) % 2) ? 0 : -1;
+      if (beh.s === 'look' && S.stage !== 'baby') fo = (Math.floor(t / 900) % 2) ? 1 : -1;
+      if (st.mood > 75 && (t % 5000) < 700) eyes = 'joy';
+    }
+    const sw = { baby: 4, child: 5, adult: 6 }[S.stage];
+    shadow(dy < -2 ? sw - 2 : sw);
+    if (fx === 'heart') pat(ctx, HEART, 18, 1 + (Math.floor(t / 200) % 2), { o: '#E8596B' });
+    if (fx === 'zzz') pat(ctx, ZZZ, 18, 3 - Math.floor(t / 700) % 3, { o: '#8A93B8' });
+    const Y = OY + dy, fb = Y + sp.bottom + 1;
+    const flash = a === 'evolve' && Math.floor(t / 120) % 2 === 0;
+    if (feet === 'stand') { [9, 10, 13, 14].forEach(x => px(ctx, x, fb, sp.o)); }
+    else if (feet === 'walk') { const f = Math.floor(t / 160) % 2; if (f) { px(ctx, 9, fb, sp.o); px(ctx, 10, fb, sp.o); } else { px(ctx, 13, fb, sp.o); px(ctx, 14, fb, sp.o); } }
+    else if (feet === 'dangle') { [9, 10, 13, 14].forEach(x => px(ctx, x, fb, sp.o)); [9, 14].forEach(x => px(ctx, x, fb + 1, sp.o)); }
+    blit(ctx, sp.g, 0, Y, flash ? '#FFFFFF' : null);
+    if (flash) { pat(ctx, SPARK, 2, Y + 4, { o: '#F5C542' }); pat(ctx, SPARK, 19, Y + 8, { o: '#F5C542' }); return; }
+
+    const E = sp.eye, ink = meta.ink, blink = (t % 3600) < 130 && eyes === 'open';
+    [E.l + fo, E.r + fo].forEach(x0 => {
+      const y0 = E.y + Y, yb = y0 + E.h - 1;
+      if (eyes === 'joy') { px(ctx, x0, y0 + 1, ink); px(ctx, x0 + 1, y0 + 1, ink); px(ctx, x0 - 1, y0 + 2, ink); px(ctx, x0 + 2, y0 + 2, ink); }
+      else if (eyes === 'sleep') { px(ctx, x0 - 1, yb - 1, ink); px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); px(ctx, x0 + 2, yb - 1, ink); }
+      else if (blink) { px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); }
+      else if (eyes === 'tired') { px(ctx, x0 - 1, yb - 1, ink); px(ctx, x0, yb - 1, ink); px(ctx, x0 + 1, yb - 1, ink); px(ctx, x0 + 2, yb - 1, ink); px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); }
+      else {
+        for (let k = 0; k < E.h; k++) { px(ctx, x0, y0 + k, ink); px(ctx, x0 + 1, y0 + k, ink); }
+        px(ctx, x0, y0, '#FFFFFF');
+        if (E.h > 2) px(ctx, x0 + 1, yb, 'rgba(255,255,255,0.45)');
+        if (eyes === 'teary') px(ctx, x0 + 1, yb, '#9FD3F5');
+      }
+    });
+    const M = sp.mouth, mx = M.x + fo, my = M.y + Y, red = '#D9534F';
+    if (mouth === 'smile') { px(ctx, mx - 1, my, ink); px(ctx, mx + 2, my, ink); px(ctx, mx, my + 1, ink); px(ctx, mx + 1, my + 1, ink); }
+    else if (mouth === 'open') { px(ctx, mx, my, ink); px(ctx, mx + 1, my, ink); px(ctx, mx, my + 1, red); px(ctx, mx + 1, my + 1, red); }
+    else if (mouth === 'o') { px(ctx, mx, my, ink); px(ctx, mx + 1, my, ink); px(ctx, mx, my + 1, ink); px(ctx, mx + 1, my + 1, ink); }
+    else if (mouth === 'frown') { px(ctx, mx, my, ink); px(ctx, mx + 1, my, ink); px(ctx, mx - 1, my + 1, ink); px(ctx, mx + 2, my + 1, ink); }
+    else if (mouth === 'wavy') { px(ctx, mx - 1, my + 1, ink); px(ctx, mx, my, ink); px(ctx, mx + 1, my + 1, ink); px(ctx, mx + 2, my, ink); }
+    else { px(ctx, mx, my + 1, ink); px(ctx, mx + 1, my + 1, ink); }
+    if (eyes !== 'sleep' && mouth !== 'frown') { const B = sp.blush;[B.l + fo, B.l + 1 + fo, B.r + fo, B.r + 1 + fo].forEach(x => px(ctx, x, B.y + Y, meta.bl)); }
+    if (laptop) {
+      const ly = Y + sp.bottom - 4, glow = Math.floor(t / 300) % 3 === 0 ? '#C7E7FA' : '#9FD3F5';
+      pat(ctx, LAPTOP, 6, ly, { k: '#5B6170', s: glow });
+    }
+    if (fx === 'rice') pat(ctx, RICE, 18, OY + 16, { o: '#4a4a4a', w: '#FFFFFF', n: '#2f3b2f' });
+    if (fx === 'ball') { const by = OY + 12 - Math.round(Math.abs(Math.sin(t / 180)) * 6); pat(ctx, BALL, 19, by, { r: '#E8596B', w: '#FFFFFF' }); }
+    if (fx === 'drop') pat(ctx, DROP, 19, Y + 6 + (Math.floor(t / 400) % 2), { o: '#7EC3F0' });
+  }
+
+  /* ===== 걷기 ===== */
+  let beh = { s: 'idle', until: 0, dir: 1 }, walkAcc = 0, walkBusy = false, walking = false, lastT = 0;
+  function canWalk(t) {
+    return S.mode === 'walk' && S.stage !== 'egg' && isWork() && !S.sleeping && S.pomo.state !== 'focus' &&
+      !panelOpen && !dragging && !(anim.type && t < anim.until) && S.stats.energy >= 25 && S.stats.full >= 30;
+  }
+  function behave(t, dt) {
+    if (!canWalk(t)) { walking = false; if (beh.s === 'walk') beh.s = 'idle'; return; }
+    if (t > beh.until) {
+      if (beh.s === 'walk') beh = { s: Math.random() < 0.6 ? 'idle' : 'look', until: t + 3000 + Math.random() * 6000, dir: beh.dir };
+      else beh = { s: 'walk', until: t + 2000 + Math.random() * 5000, dir: Math.random() < 0.5 ? -1 : 1 };
+    }
+    walking = beh.s === 'walk';
+    if (!walking) return;
+    walkAcc += beh.dir * CFG.SPEED[S.stage] * dt / 1000;
+    const step = Math.trunc(walkAcc);
+    if (step !== 0 && !walkBusy) {
+      walkAcc -= step; walkBusy = true;
+      api.walk(step).then(r => { walkBusy = false; if (r && r.hit) beh.dir = -beh.dir; }).catch(() => { walkBusy = false; });
+    }
+  }
+  function setMode(m) {
+    S.mode = m; api.setMode(m); beh = { s: 'idle', until: 0, dir: 1 };
+    if (m === 'walk') api.snapBottom();
+    say(m === 'walk' ? '산책 모드! 돌아다닐게' : '여기 가만히 앉아 있을게'); save(); renderPanel();
+  }
+
+  function loop(t) {
+    const dt = Math.min(100, t - (lastT || t)); lastT = t;
+    if (S) {
+      behave(t, dt);
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      if (S.stage === 'egg') drawEgg(t); else drawPet(t);
+    }
+    requestAnimationFrame(loop);
+  }
+
+  /* ===== 메뉴 ===== */
+  const panel = document.getElementById('panel'); let panelOpen = false, view = 'status', panelPress = false;
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  function bar(label, v) { const n = Math.round(v); return '<div class="lbl"><span>' + label + '</span><span>' + n + '</span></div><div class="bar"><i class="' + (n < 30 ? 'low' : '') + '" style="width:' + n + '%"></i></div>'; }
+  const VIEWS = {
+    status() {
+      const dis = isWork() ? '' : 'disabled'; let h = '';
+      if (S.stage === 'egg') {
+        h += bar('부화까지', Math.min(100, S.egg.prog / CFG.STAGE_MIN.egg * 100)) + '<div class="sub">' + SPR.HINT[eggHint()] + '</div>';
+        h += '<div class="row"><button data-a="feed" ' + dis + '>밥주기</button><button data-a="play" ' + dis + '>놀아주기</button><button data-a="rest" ' + dis + '>덮어주기</button></div>';
+      } else {
+        const st = S.stats;
+        if (S.stage !== 'adult') h += bar(S.stage === 'baby' ? '어린이까지' : '어른까지', Math.min(100, S.stageMin / CFG.STAGE_MIN[S.stage] * 100));
+        h += bar('배부름', st.full) + bar('기분', st.mood) + bar('기운', st.energy);
+        h += '<div class="row"><button data-a="feed" ' + dis + '>밥주기</button><button data-a="play" ' + dis + '>놀아주기</button><button data-a="rest" ' + dis + '>' + (S.sleeping ? '깨우기' : '재우기') + '</button></div>';
+        if (S.stage === 'adult') h += '<div class="row"><button data-a="newegg">새 알 받기</button></div>';
+      }
+      if (!isWork()) h += '<div class="sub note">지금은 쉬는 시간이라 시간이 멈춰 있어 (평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시에만 흘러가)</div>';
+      return h;
+    },
+    todo() {
+      let h = '<div class="todo-add"><input id="todoIn" maxlength="60" placeholder="할 일 입력 후 Enter"><button data-a="todoAdd">추가</button></div><ul class="todos">';
+      if (!S.todos.length) h += '<li class="sub" style="border:none">아직 할 일이 없어</li>';
+      S.todos.forEach(x => { h += '<li class="' + (x.done ? 'done' : '') + '"><label><input type="checkbox" data-t="' + x.id + '"' + (x.done ? ' checked' : '') + '><span title="' + esc(x.t) + '">' + esc(x.t) + '</span></label><button class="ic" data-del="' + x.id + '" title="삭제">×</button></li>'; });
+      h += '</ul><div class="sub note">완료하면 펫 기분이 올라가. 완료한 항목은 다음 날 자동 정리 · 오늘 완료 ' + S.daily.todo + '개</div>';
+      return h;
+    },
+    pomo() {
+      const p = S.pomo, left = p.state === 'idle' ? pomoDur('focus') : p.until - Date.now();
+      const label = { idle: '대기 중', focus: '집중 중 — 펫도 같이 일하는 중', break: '쉬는 시간' }[p.state];
+      let h = '<div class="pomo"><div class="big" id="pomoT">' + mmss(left) + '</div><div class="sub" id="pomoL">' + label + '</div></div>';
+      h += '<div class="row">' + (p.state === 'idle' ? '<button data-a="pomoStart">집중 시작 (' + CFG.POMO.focus + '분)</button>' : '<button data-a="pomoStop">멈추기</button>') + '</div>';
+      h += '<div class="sub note">끝까지 집중하면 펫 기분이 크게 올라가 · 오늘 ' + S.daily.pomo + '회 / 누적 ' + S.count.pomo + '회</div>';
+      return h;
+    },
+    dex() {
+      const got = SPR.ORDER.filter(k => S.dex[k]).length, big = SPR.ORDER.filter(k => S.dex[k] && S.dex[k].adult).length;
+      let h = '<div class="sub" style="margin-bottom:6px">만난 아이 ' + got + '/4 · 다 키운 아이 ' + big + '/4</div><div class="dex">';
+      SPR.ORDER.forEach(k => { const d = S.dex[k]; h += '<div><canvas width="24" height="24" data-sp="' + k + '"></canvas>' + (d ? '<b>' + SPR.META[k].name + (d.adult ? ' ★' : '') + '</b><br>' + SPR.META[k].desc : '<b>???</b><br>&nbsp;') + '</div>'; });
+      return h + '</div>';
+    },
+    cfg() {
+      const tg = (a, on, txt) => '<button class="toggle' + (on ? ' on' : '') + '" data-a="' + a + '">' + txt + '</button>';
+      let h = '<div class="lbl">펫 위치</div><div class="row">' + tg('walk', S.mode === 'walk', '걸어다니기') + tg('sit', S.mode === 'sit', '앉아있기') + '</div>';
+      h += '<div class="lbl" style="margin-top:8px">근무</div><div class="row">' + tg('dayoff', S.dayOff === today(), '오늘 휴무 ' + (S.dayOff === today() ? '켜짐' : '꺼짐')) + tg('fast', S.fast, '빠른 모드 ' + (S.fast ? '켜짐' : '꺼짐')) + '</div>';
+      h += '<div class="lbl" style="margin-top:8px">프로그램</div><div class="row">' + tg('autostart', autostart, '자동 실행 ' + (autostart ? '켜짐' : '꺼짐')) + '<button data-a="update">업데이트 확인</button></div>';
+      h += '<div class="sub note">근무시간 평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시 · 숨기기 Esc / Ctrl+Alt+P · 빠른 모드는 테스트용(1초=근무 ' + CFG.FAST + '분) · 버전 ' + esc(version) + '</div>';
+      h += '<div class="row"><button data-a="reset">처음부터 다시</button></div>';
+      return h;
+    }
+  };
+  function renderPanel() {
+    if (!panelOpen) return;
+    const title = S.stage === 'egg' ? '알' : SPR.META[S.species].name + ' · ' + STAGE_KO[S.stage];
+    const tabs = [['status', '상태'], ['todo', '할 일'], ['pomo', '집중'], ['dex', '도감'], ['cfg', '설정']];
+    let h = '<div class="ph"><div><b>' + title + '</b><div class="sub" id="leave">' + leaveText() + '</div></div><div class="ph-btns"><button class="ic" data-a="hide" title="숨기기 (Esc)">–</button><button class="ic" data-a="close" title="닫기">×</button></div></div>';
+    h += '<div class="tabs">' + tabs.map(([k, l]) => '<button class="tab' + (view === k ? ' on' : '') + '" data-v="' + k + '">' + l + '</button>').join('') + '</div>';
+    h += '<div class="body">' + VIEWS[view]() + '</div><div class="pmsg" id="pmsg">' + esc(lastMsgShown ? lastMsg : '') + '</div>';
+    panel.innerHTML = h;
+    panel.querySelectorAll('canvas[data-sp]').forEach(c => { const k = c.dataset.sp, x = c.getContext('2d'), d = S.dex[k]; blit(x, SPR.SPR[k].adult.g, 0, 0, d ? null : '#C8C8D0', 1); });
+  }
+  let lastMsgShown = false;
+  function liveRefresh() {
+    const lv = document.getElementById('leave'); if (lv) lv.textContent = leaveText();
+    if (panelPress) return;
+    if (view === 'status') renderPanel();
+    else if (view === 'pomo') {
+      const p = S.pomo, el = document.getElementById('pomoT');
+      if (el && p.state !== 'idle') el.textContent = mmss(p.until - Date.now());
+      if (el && (p.state === 'idle') !== !!panel.querySelector('[data-a="pomoStart"]')) renderPanel();
+    }
+  }
+  function openPanel(v) { panelOpen = true; view = v || view; lastMsgShown = false; panel.classList.add('on'); bub.classList.remove('on'); renderPanel(); }
+  function closePanel() { panelOpen = false; panel.classList.remove('on'); }
+  function togglePanel() { panelOpen ? closePanel() : openPanel('status'); }
+
+  let autostart = false, version = '';
+  panel.addEventListener('mousedown', () => { panelPress = true; });
+  window.addEventListener('mouseup', () => { panelPress = false; });
+  panel.addEventListener('click', async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    lastMsgShown = true;
+    if (b.dataset.v) { view = b.dataset.v; renderPanel(); if (view === 'todo') { const i = document.getElementById('todoIn'); if (i) i.focus(); } return; }
+    if (b.dataset.del) { delTodo(b.dataset.del); renderPanel(); return; }
+    const a = b.dataset.a;
+    if (a === 'feed' || a === 'play' || a === 'rest') act(a);
+    else if (a === 'close') closePanel();
+    else if (a === 'hide') { closePanel(); api.hide(); }
+    else if (a === 'todoAdd') { const i = document.getElementById('todoIn'); if (addTodo(i.value)) { renderPanel(); const n = document.getElementById('todoIn'); if (n) n.focus(); } }
+    else if (a === 'pomoStart') { pomoStart(); renderPanel(); }
+    else if (a === 'pomoStop') { pomoStop(); renderPanel(); }
+    else if (a === 'walk' || a === 'sit') setMode(a);
+    else if (a === 'dayoff') { S.dayOff = S.dayOff === today() ? null : today(); S.last = Date.now(); say(S.dayOff ? '오늘은 푹 쉬자! 시간도 멈출게' : '휴무 해제! 다시 출근 모드'); save(); renderPanel(); }
+    else if (a === 'fast') { S.fast = !S.fast; S.last = Date.now(); say(S.fast ? '빠른 모드 켜짐' : '빠른 모드 꺼짐'); save(); renderPanel(); }
+    else if (a === 'autostart') { autostart = await api.setAutostart(!autostart); say(autostart ? '윈도우 켤 때 같이 켜질게' : '자동 실행 껐어'); renderPanel(); }
+    else if (a === 'update') { api.checkUpdate(); say('업데이트 확인 중…'); }
+    else if (a === 'newegg') { if (confirm('새 알을 받을까? 지금 아이는 도감에 남아.')) { const keep = { dex: S.dex, mode: S.mode, fast: S.fast, todos: S.todos, count: S.count, daily: S.daily, dayOff: S.dayOff, pomo: S.pomo }; S = Object.assign(fresh(), keep); save(); view = 'status'; renderPanel(); say('새 알을 받았어!'); } }
+    else if (a === 'reset') { if (confirm('도감까지 전부 지우고 처음부터 시작할까?')) { const mode = S.mode; S = fresh(); S.mode = mode; save(); view = 'status'; renderPanel(); say('새 알을 받았어!'); } }
+  });
+  panel.addEventListener('change', e => {
+    const c = e.target; if (c.dataset && c.dataset.t) { lastMsgShown = true; toggleTodo(c.dataset.t, c.checked); renderPanel(); }
+  });
+  panel.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.target.id === 'todoIn') { lastMsgShown = true; if (addTodo(e.target.value)) { renderPanel(); const n = document.getElementById('todoIn'); if (n) n.focus(); } }
+    e.stopPropagation();
+  });
+
+  /* ===== 마우스: 클릭 통과, 드래그, 클릭 ===== */
+  let down = null, dragging = false, ignoring = true;
+  function interactive(x, y) {
+    if (dragging || down) return true;
+    const el = document.elementFromPoint(x, y); if (!el) return false;
+    if (el.closest('#panel') || el.id === 'menuBtn') return true;
+    if (el === cv) {
+      const r = cv.getBoundingClientRect(), cx = Math.floor((x - r.left) * cv.width / r.width), cy = Math.floor((y - r.top) * cv.height / r.height);
+      try { const d = ctx.getImageData(Math.max(0, cx - 4), Math.max(0, cy - 4), 9, 9).data; for (let i = 3; i < d.length; i += 4) if (d[i] > 0) return true; } catch (e) { return true; }
+    }
+    return false;
+  }
+  function setIgnore(on) { if (on !== ignoring) { ignoring = on; api.setIgnore(on); } }
+  document.addEventListener('mousemove', e => {
+    setIgnore(!interactive(e.clientX, e.clientY));
+    if (down && !dragging && Math.hypot(e.screenX - down.sx, e.screenY - down.sy) > 4) { dragging = true; closePanel(); api.dragStart(down.x, down.y); }
+  });
+  document.addEventListener('mouseleave', () => { if (!dragging && !down) setIgnore(true); });
+  cv.addEventListener('mousedown', e => { if (e.button !== 0) return; down = { x: e.clientX, y: e.clientY, sx: e.screenX, sy: e.screenY }; });
+  window.addEventListener('mouseup', async e => {
+    if (e.button !== 0) return;
+    if (dragging) { dragging = false; down = null; await api.dragEnd(); if (S.mode === 'walk') api.snapBottom(); save(); }
+    else if (down) { down = null; poke(); }
+  });
+  window.addEventListener('blur', () => { if (dragging) { dragging = false; down = null; api.dragEnd(); if (S && S.mode === 'walk') api.snapBottom(); } if (panelOpen && !panel.contains(document.activeElement)) closePanel(); });
+  cv.addEventListener('contextmenu', e => { e.preventDefault(); togglePanel(); });
+  document.getElementById('menuBtn').addEventListener('click', togglePanel);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePanel(); api.hide(); } });
+
+  /* ===== 프로그램 쪽 신호 ===== */
+  api.on('cmd', c => {
+    if (!S) return;
+    if (c === 'mode-walk') setMode('walk'); else if (c === 'mode-sit') setMode('sit');
+    else if (c === 'menu') openPanel('status');
+  });
+  api.on('msg', t => say(t, 4000));
+  api.on('update', v => say('새 버전 ' + v + ' 준비 완료! 다음 실행 때 적용돼', 6000));
+  api.on('flush', () => { if (S && api.saveSync) api.saveSync(JSON.parse(JSON.stringify(S))); });
+
+  /* ===== 시작 ===== */
+  (async () => {
+    let d = null; try { d = await api.load(); } catch (e) { }
+    const first = !d || d.v !== 2;
+    S = first ? fresh() : Object.assign(fresh(), d);
+    rollDaily();
+    try { autostart = await api.getAutostart(); version = await api.version(); } catch (e) { }
+    api.setMode(S.mode); api.setIgnore(true);
+    if (S.mode === 'walk') api.snapBottom();
+    tick(); setInterval(tick, 1000); setInterval(save, 10000);
+    window.addEventListener('beforeunload', () => { if (api.saveSync) api.saveSync(JSON.parse(JSON.stringify(S))); });
+    requestAnimationFrame(loop);
+    if (first) setTimeout(() => say('알을 받았어! 클릭은 쓰다듬기, 우클릭은 메뉴, 끌어서 옮길 수 있어', 6000), 500);
+    else if (!isWork()) setTimeout(() => say(S.stage === 'egg' ? '알도 쉬는 중… zZ' : offReason()), 500);
+    else setTimeout(() => say(S.stage === 'egg' ? '좋은 아침!' : ['출근했어? 좋은 아침!', '오늘도 같이 힘내자', '왔구나!'][Math.floor(Math.random() * 3)]), 500);
+  })();
+})();
