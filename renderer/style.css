@@ -10,15 +10,19 @@ html,body{margin:0;height:100%;background:transparent;overflow:hidden;font-famil
 .panel{position:absolute;left:8px;right:8px;bottom:148px;max-height:325px;display:none;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;box-shadow:0 4px 18px rgba(0,0,0,.14);font-size:12px;z-index:10}
 .panel.on{display:flex}
 .body{overflow-y:auto;max-height:225px;padding-right:2px}
-.ph{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;flex-shrink:0}
+.ph{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;flex-shrink:0;gap:4px}
 .ph b{font-size:13px}
-.ph-btns{display:flex;gap:4px}
+.ph-btns{display:flex;gap:3px;align-items:center}
 .panel button{font:inherit;font-size:11.5px;padding:5px 7px;border:1px solid var(--line);border-radius:8px;background:#fafafa;color:var(--ink);cursor:pointer;transition:background .15s,border-color .15s}
 .panel button:hover{background:#f0f0f3}
 .panel button:disabled{opacity:.45;cursor:default}
 .panel button.pri{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
 .panel button.pri:hover{background:#d1667d}
 .panel button.ic{padding:0;width:22px;height:22px;line-height:20px;border-radius:6px;color:var(--sub)}
+.panel button.ic.slot{font-size:11px;font-weight:600;background:var(--soft);color:var(--ink)}
+.panel button.ic.slot.empty{border-style:dashed;color:var(--sub);opacity:.75}
+.panel button.ic.slot.on{background:var(--acc);border-color:var(--acc);border-style:solid;color:#fff;opacity:1}
+.slot-sep{width:1px;height:14px;background:var(--line);margin:0 2px}
 .tabs{display:flex;gap:2px;background:var(--soft);border-radius:8px;padding:2px;margin-bottom:8px;flex-shrink:0}
 .tabs .tab{flex:1;border:none;background:transparent;padding:4px 0;border-radius:6px;color:var(--sub);font-size:11.5px}
 .tabs .tab.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08);font-weight:600}

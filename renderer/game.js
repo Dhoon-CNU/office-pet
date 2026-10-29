@@ -1,4 +1,4 @@
-/* 사무실 펫 — 치이카와 에디션 게임 로직 */
+/* 사무실 펫 — 치이카와 7종 에디션 게임 로직 (3슬롯 다중 육성 지원) */
 (function () {
   'use strict';
   const SPR = window.Sprites;
@@ -45,7 +45,7 @@
     snapBottom: async () => { webY = 0; applyWebPos(); },
     hide() { document.body.classList.add('hidden'); },
     setMode() { }, getAutostart: async () => false, setAutostart: async () => false,
-    version: async () => '0.3.0 (웹 미리보기)', checkUpdate() { }, on() { }
+    version: async () => '0.4.0 (3슬롯·치이카와)', checkUpdate() { }, on() { }
   };
   if (!window.officePet) {
     window.addEventListener('mousemove', e => {
@@ -58,7 +58,7 @@
     });
   }
 
-  /* ===== 상태 ===== */
+  /* ===== 상태 (펫 1마리 단위 + 전체 3슬롯 구조) ===== */
   const pad = n => String(n).padStart(2, '0');
   const dayKey = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
   const today = () => dayKey(new Date());
@@ -68,38 +68,89 @@
     target: target || 'chiikawa',
     last: {}
   });
+  const freshPet = (hatchMode, target) => ({
+    stage: 'egg', species: null, egg: freshEgg(hatchMode, target),
+    stats: { full: 75, mood: 75, energy: 85 },
+    sleeping: false, stageMin: 0
+  });
   function fresh() {
     return {
-      v: 3, stage: 'egg', species: null, egg: freshEgg('random', 'chiikawa'),
-      stats: { full: 75, mood: 75, energy: 85 },
-      sleeping: false, stageMin: 0, dex: {}, fast: false, mode: 'walk', gfx: 'image', dayOff: null,
+      v: 4, slots: [freshPet('random', 'chiikawa'), null, null], active: 0,
+      dex: {}, fast: false, mode: 'walk', gfx: 'image', dayOff: null,
       todos: [], pomo: { state: 'idle', until: 0 }, count: { todo: 0, pomo: 0 }, daily: { day: today(), todo: 0, pomo: 0 },
       last: Date.now()
     };
   }
-  let S = null, confirmBox = null;
+  let S = null, P = null, confirmBox = null;
+  function normalizePet(p) {
+    if (!p || typeof p !== 'object') return null;
+    const fp = freshPet('random', 'chiikawa');
+    Object.assign(fp, p);
+    fp.egg = Object.assign(freshEgg('random', 'chiikawa'), p.egg || {});
+    if (!SPR.ORDER.includes(fp.egg.target)) fp.egg.target = 'chiikawa';
+    if (!['random', 'care', 'select'].includes(fp.egg.hatchMode)) fp.egg.hatchMode = 'random';
+    if (fp.stage !== 'egg' && !SPR.ORDER.includes(fp.species)) fp.species = 'chiikawa';
+    fp.stats = Object.assign({ full: 75, mood: 75, energy: 85 }, p.stats || {});
+    return fp;
+  }
+  const usePet = () => {
+    if (!Array.isArray(S.slots) || S.slots.length < 3) S.slots = [freshPet('random', 'chiikawa'), null, null];
+    if (typeof S.active !== 'number' || S.active < 0 || S.active > 2) S.active = 0;
+    if (!S.slots[S.active]) S.slots[S.active] = freshPet('random', 'chiikawa');
+    P = S.slots[S.active];
+  };
   function save() { if (S) api.save(JSON.parse(JSON.stringify(S))); }
 
-  /* ===== 구버전 저장 데이터 호환 ===== */
+  /* ===== 구버전 저장 데이터 호환 (단일 펫 v2/v3 → 1번 슬롯으로 자동 이전) ===== */
   function migrateSave(d) {
     if (!d) return null;
     const base = fresh();
-    Object.assign(base, d);
-    base.v = 3;
-    base.egg = Object.assign(freshEgg('random', 'chiikawa'), d.egg || {});
-    if (!SPR.ORDER.includes(base.egg.target)) base.egg.target = 'chiikawa';
-    if (!['random', 'care', 'select'].includes(base.egg.hatchMode)) base.egg.hatchMode = 'random';
-    if (base.stage !== 'egg' && !SPR.ORDER.includes(base.species)) {
-      base.species = 'chiikawa';
+    if (!Array.isArray(d.slots)) {
+      const pet = normalizePet({
+        stage: d.stage, species: d.species, egg: d.egg,
+        stats: d.stats, sleeping: d.sleeping, stageMin: d.stageMin
+      });
+      ['stage', 'species', 'egg', 'stats', 'sleeping', 'stageMin'].forEach(k => delete d[k]);
+      Object.assign(base, d);
+      base.slots = [pet || freshPet('random', 'chiikawa'), null, null];
+      base.active = 0;
+    } else {
+      Object.assign(base, d);
+      base.slots = [0, 1, 2].map(i => normalizePet(d.slots[i]));
+      if (!base.slots[0] && !base.slots[1] && !base.slots[2]) {
+        base.slots[0] = freshPet('random', 'chiikawa');
+      }
     }
+    base.v = 4;
     if (!['image', 'pixel'].includes(base.gfx)) base.gfx = 'image';
-    // 기존 도감 키 정리
     const cleanDex = {};
     for (const k of SPR.ORDER) {
       if (base.dex && base.dex[k]) cleanDex[k] = base.dex[k];
     }
     base.dex = cleanDex;
     return base;
+  }
+
+  /* ===== 슬롯 전환 (비활성 슬롯은 시간 멈춤·보관) ===== */
+  function switchSlot(i) {
+    if (hatching || i === S.active || i < 0 || i > 2) return;
+    const isNew = !S.slots[i];
+    if (isNew) S.slots[i] = freshPet('random', 'chiikawa');
+    S.active = i;
+    usePet();
+    S.last = Date.now();
+    anim = { type: null, until: 0 };
+    beh = { s: 'idle', until: 0, dir: 1 };
+    walking = false;
+    confirmBox = null;
+    if (isNew) {
+      view = 'hatch';
+      say((i + 1) + '번 슬롯에 새 알을 받았어! 부화 방식을 골라줘', 4000);
+    } else {
+      if (view === 'hatch' && P.stage !== 'egg') view = 'status';
+      say((i + 1) + '번 슬롯: ' + (P.stage === 'egg' ? '알이 나왔어!' : SPR.META[P.species].name + ' 나왔어!'));
+    }
+    save(); renderPanel();
   }
 
   /* ===== 시간 ===== */
@@ -142,8 +193,8 @@
   }
 
   /* ===== 부화 분기 (랜덤 / 돌봄 성향 / 캐릭터 직접 선택) ===== */
-  function decideCare(ignoreNeglect) {
-    const e = S.egg;
+  function decideCare(ignoreNeglect, pet) {
+    const e = (pet || P).egg;
     const t = e.feed + e.play + e.rest;
     const all = t + e.poke + (e.work || 0);
     if (!ignoreNeglect && all < CFG.NEGLECT) return 'momonga';
@@ -154,63 +205,63 @@
     if (e.poke > t && all > 0) return 'hachiware';
     return 'chiikawa';
   }
-  function decideSpecies(ignoreNeglect) {
-    const e = S.egg;
+  function decideSpecies(ignoreNeglect, pet) {
+    const e = (pet || P).egg;
     if (e.hatchMode === 'select' && SPR.ORDER.includes(e.target)) {
       return e.target;
     }
     if (e.hatchMode === 'random') {
-      // 아직 도감에 없는 캐릭터가 있으면 70% 확률로 미보유 캐릭터 중 선택
       const unowned = SPR.ORDER.filter(k => !S.dex[k]);
       const pool = (unowned.length > 0 && Math.random() < 0.7) ? unowned : SPR.ORDER;
       return pool[Math.floor(Math.random() * pool.length)];
     }
-    return decideCare(ignoreNeglect);
+    return decideCare(ignoreNeglect, pet);
   }
-  function eggHint() {
-    const e = S.egg;
+  function eggHint(pet) {
+    const e = (pet || P).egg;
     if (e.hatchMode === 'select' && SPR.ORDER.includes(e.target)) return e.target;
     if (e.hatchMode === 'random') return 'random';
     const all = e.feed + e.play + e.rest + e.poke + (e.work || 0), p = e.prog / CFG.STAGE_MIN.egg;
     if (all < 3 && p < 0.5) return 'neutral';
-    return decideCare(p < 0.5);
+    return decideCare(p < 0.5, pet);
   }
-  function hatchModeLabel() {
-    const e = S.egg;
+  function hatchModeLabel(pet) {
+    const e = (pet || P).egg;
     if (e.hatchMode === 'select') return '직접 선택 (' + SPR.META[e.target].name + ')';
-    if (e.hatchMode === 'random') return '랜덤 부화 (7종 무작위)';
+    if (e.hatchMode === 'random') return '랜덤 부화';
     return '돌봄 성향 부화';
   }
 
-  /* ===== 진행 ===== */
+  /* ===== 진행 (현재 화면에 나와 있는 활성 슬롯 P만 진행) ===== */
   let anim = { type: null, until: 0 }, hatching = false;
   const play = (type, ms) => { anim = { type, until: performance.now() + ms }; };
-  function clampStats() { const st = S.stats; for (const k of ['full', 'mood', 'energy']) st[k] = Math.max(0, Math.min(100, st[k])); }
+  function clampStats(pet) { const st = (pet || P).stats; for (const k of ['full', 'mood', 'energy']) st[k] = Math.max(0, Math.min(100, st[k])); }
   function advance(dm) {
-    if (S.stage === 'egg') {
-      S.egg.prog += dm;
-      if (S.egg.prog >= CFG.STAGE_MIN.egg && !hatching) startHatch();
+    if (P.stage === 'egg') {
+      P.egg.prog += dm;
+      if (P.egg.prog >= CFG.STAGE_MIN.egg && !hatching) startHatch();
       return;
     }
-    const st = S.stats;
-    if (S.sleeping) {
+    const st = P.stats;
+    if (P.sleeping) {
       st.energy += dm * CFG.SLEEP.energy; st.full -= dm * CFG.SLEEP.full;
-      if (st.energy >= 100) { st.energy = 100; S.sleeping = false; say('잘 잤다!'); }
+      if (st.energy >= 100) { st.energy = 100; P.sleeping = false; say('잘 잤다!'); }
     } else {
       st.full -= dm * CFG.DECAY.full; st.mood -= dm * CFG.DECAY.mood; st.energy -= dm * CFG.DECAY.energy;
       if (st.full < 20) st.mood -= dm * 0.2;
-      if (st.energy <= 0) { st.energy = 0; S.sleeping = true; say('기운이 없어서 잠들었어'); }
+      if (st.energy <= 0) { st.energy = 0; P.sleeping = true; say('기운이 없어서 잠들었어'); }
     }
-    clampStats();
-    if (S.stage !== 'adult') {
+    clampStats(P);
+    if (P.stage !== 'adult') {
       const rate = (st.full < 20 || st.mood < 20) ? 0.5 : 1;
-      S.stageMin += dm * rate;
-      if (S.stageMin >= CFG.STAGE_MIN[S.stage]) evolve();
+      P.stageMin += dm * rate;
+      if (P.stageMin >= CFG.STAGE_MIN[P.stage]) evolve();
     }
   }
-  function completeHatch() {
-    const sp = decideSpecies(false);
-    Object.assign(S, { stage: 'baby', species: sp, stats: { full: 75, mood: 80, energy: 85 }, sleeping: false, stageMin: 0 });
+  function completeHatch(pet) {
+    pet = pet || P;
+    const sp = decideSpecies(false, pet);
+    Object.assign(pet, { stage: 'baby', species: sp, stats: { full: 75, mood: 80, energy: 85 }, sleeping: false, stageMin: 0 });
     S.dex[sp] = S.dex[sp] || { first: Date.now(), adult: false };
     hatching = false; play('joy', 1800); say(SPR.META[sp].born, 4000); save();
     if (view === 'hatch') view = 'status';
@@ -218,66 +269,67 @@
   }
   function startHatch(instant) {
     if (hatching) return;
+    const pet = P; // 부화 시작 시점의 펫 고정
     if (instant) {
-      completeHatch();
+      completeHatch(pet);
       return;
     }
     hatching = true; play('hatch', 2400); say('어? 알이 흔들려…!', 2400);
-    setTimeout(completeHatch, 2400);
+    setTimeout(() => completeHatch(pet), 2400);
   }
   function evolve() {
-    S.stage = NEXT[S.stage]; S.stageMin = 0;
+    P.stage = NEXT[P.stage]; P.stageMin = 0;
     play('evolve', 1400);
-    if (S.stage === 'adult') { S.dex[S.species].adult = true; say('다 컸어! 어른 ' + SPR.META[S.species].name + ' (도감에 ★ 등록)', 4500); }
+    if (P.stage === 'adult') { S.dex[P.species].adult = true; say('다 컸어! 어른 ' + SPR.META[P.species].name + ' (도감에 ★ 등록)', 4500); }
     else say('쑥 자랐어! 이제 어린이야', 3500);
     save(); renderPanel();
   }
 
   /* ===== 돌보기 ===== */
-  function canCount(k) { const now = Date.now(), cd = S.fast ? 3000 : CFG.COOLDOWN; if (now - (S.egg.last[k] || 0) >= cd) { S.egg.last[k] = now; return true; } return false; }
+  function canCount(k) { const now = Date.now(), cd = S.fast ? 3000 : CFG.COOLDOWN; if (now - (P.egg.last[k] || 0) >= cd) { P.egg.last[k] = now; return true; } return false; }
   function act(k) {
     if (!isWork()) { say('지금은 쉬는 시간이야 (평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시 · 설정에서 빠른 모드를 켜면 바로 가능해)'); return; }
     if (hatching) return;
-    if (S.stage === 'egg') {
-      if (canCount(k)) S.egg[k]++;
+    if (P.stage === 'egg') {
+      if (canCount(k)) P.egg[k]++;
       say({ feed: '알이 따뜻해진 것 같아', play: '알이 살짝 흔들렸어!', rest: '포근하게 덮어줬어' }[k]);
       play('wobble', 600);
     } else {
-      const st = S.stats;
+      const st = P.stats;
       if (k === 'feed') {
-        if (S.sleeping) { say('자는 중이야…'); return; }
+        if (P.sleeping) { say('자는 중이야…'); return; }
         if (st.full > 90) { say('배불러…'); st.mood -= 3; }
         else { st.full += 35; st.mood += 5; say('냠냠! 맛있다~'); play('eat', 2000); }
       } else if (k === 'play') {
-        if (S.sleeping) { say('자는 중이야…'); return; }
+        if (P.sleeping) { say('자는 중이야…'); return; }
         if (st.energy < 15) { say('너무 졸려…'); return; }
         st.mood += 25; st.energy -= 8; st.full -= 5; say('우와! 신난다!'); play('play', 2200);
       } else if (k === 'rest') {
-        S.sleeping = !S.sleeping; say(S.sleeping ? '잘 자~ zZ' : '일어났어!');
+        P.sleeping = !P.sleeping; say(P.sleeping ? '잘 자~ zZ' : '일어났어!');
       }
-      clampStats();
+      clampStats(P);
     }
     save(); renderPanel();
   }
   function poke() {
     if (hatching) return;
-    if (S.stage === 'egg') {
+    if (P.stage === 'egg') {
       if (!isWork()) { say('알도 쉬는 중… zZ'); return; }
-      if (canCount('poke')) S.egg.poke++;
+      if (canCount('poke')) P.egg.poke++;
       say(['톡톡…', '안에서 꼬물거려!', '따뜻하다~'][Math.floor(Math.random() * 3)]);
       play('wobble', 600); save(); return;
     }
     if (!isWork()) { say(offReason()); return; }
-    if (S.sleeping) { say('zZ… (쿨쿨 자는 중)'); return; }
+    if (P.sleeping) { say('zZ… (쿨쿨 자는 중)'); return; }
     if (S.pomo.state === 'focus') { say(['집중 중이야!', '조금만 더 힘내자!', '타닥타닥…'][Math.floor(Math.random() * 3)]); return; }
-    const pool = ['헤헤~', '왜 불렀어?', '오늘 일 잘 돼?', '같이 힘내자!'].concat(SPR.META[S.species].lines);
-    S.stats.mood = Math.min(100, S.stats.mood + 2);
+    const pool = ['헤헤~', '왜 불렀어?', '오늘 일 잘 돼?', '같이 힘내자!'].concat(SPR.META[P.species].lines);
+    P.stats.mood = Math.min(100, P.stats.mood + 2);
     say(pool[Math.floor(Math.random() * pool.length)]);
     play('joy', 1400); save();
   }
   function reward(mood, msg) {
-    if (S.stage !== 'egg') { S.stats.mood += mood; clampStats(); play('joy', 1600); }
-    else { S.egg.work = (S.egg.work || 0) + 1; play('wobble', 600); }
+    if (P.stage !== 'egg') { P.stats.mood += mood; clampStats(P); play('joy', 1600); }
+    else { P.egg.work = (P.egg.work || 0) + 1; play('wobble', 600); }
     say(msg);
   }
 
@@ -310,7 +362,7 @@
     if (p.state === 'focus' && now >= p.until) {
       S.count.pomo++; S.daily.pomo++;
       S.pomo = { state: 'break', until: now + pomoDur('brk') };
-      if (S.stage !== 'egg') { S.stats.energy -= 5; }
+      if (P.stage !== 'egg') { P.stats.energy -= 5; }
       reward(15, '집중 끝! ' + CFG.POMO.brk + '분 동안 푹 쉬자'); save();
     } else if (p.state === 'break' && now >= p.until) {
       S.pomo = { state: 'idle', until: 0 }; say('쉬는 시간 끝! 다시 달려볼까?', 4000); save();
@@ -365,7 +417,7 @@
   function shadow(w) { ctx.fillStyle = 'rgba(0,0,0,0.13)'; ctx.fillRect((12 - w) * SC, (OY + 23) * SC, w * 2 * SC, SC); }
 
   function drawEgg(t) {
-    const hint = eggHint(), g = SPR.EGG[hint] || SPR.EGG.neutral;
+    const hint = eggHint(P), g = SPR.EGG[hint] || SPR.EGG.neutral;
     let dx = 0;
     if (anim.type === 'hatch') dx = Math.floor(t / 60) % 2 ? 1 : -1;
     else if (anim.type === 'wobble' && t < anim.until) dx = Math.floor(t / 80) % 2 ? 1 : -1;
@@ -373,7 +425,7 @@
     shadow(6);
     const flash = anim.type === 'hatch' && t > anim.until - 350;
     blit(ctx, g, dx, OY, flash ? '#FFFFFF' : null);
-    const p = S.egg.prog / CFG.STAGE_MIN.egg, o = (SPR.EGGP[hint] || SPR.EGGP.neutral).o;
+    const p = P.egg.prog / CFG.STAGE_MIN.egg, o = (SPR.EGGP[hint] || SPR.EGGP.neutral).o;
     if (p >= 0.8 && !flash) [[8, 11], [9, 12], [10, 11], [11, 12], [12, 11], [13, 12], [14, 11], [15, 12]].forEach(([x, y]) => px(ctx, x + dx, y + OY, o));
     if (p >= 0.95 && !flash) [[10, 13], [14, 13], [12, 10]].forEach(([x, y]) => px(ctx, x + dx, y + OY, o));
     if (!isWork()) pat(ctx, ZZZ, 18, 3 - Math.floor(t / 700) % 3, { o: '#8A93B8' });
@@ -383,7 +435,7 @@
     let expr = 'normal', dy = 0, fx = null, fo = 0, laptop = false, walkTilt = 0;
     const blink = (t % 3600) < 130;
     if (dragging) { expr = 'eat'; dy = -2; }
-    else if (!work || S.sleeping) { expr = 'sleep'; dy = (Math.floor(t / 1100) % 2) ? 1 : 0; fx = 'zzz'; }
+    else if (!work || P.sleeping) { expr = 'sleep'; dy = (Math.floor(t / 1100) % 2) ? 1 : 0; fx = 'zzz'; }
     else if (a === 'joy' || a === 'play') { expr = 'joy'; const q = [0, -1, -3, -4, -3, -1]; dy = q[Math.floor(t / 85) % q.length]; fx = a === 'play' ? 'ball' : 'heart'; }
     else if (a === 'eat') { expr = (Math.floor(t / 180) % 2) ? 'eat' : 'normal'; fx = 'rice'; dy = (Math.floor(t / 180) % 2) ? 0 : -1; }
     else if (S.pomo.state === 'focus') { expr = blink ? 'sleep' : 'normal'; laptop = true; if ((t % 7000) < 900) fx = 'drop'; }
@@ -401,16 +453,16 @@
       else if (blink) expr = 'sleep';
     }
 
-    const sw = { baby: 4, child: 5, adult: 6 }[S.stage];
+    const sw = { baby: 4, child: 5, adult: 6 }[P.stage];
     shadow(dy < -2 ? sw - 2 : sw);
     if (fx === 'heart') pat(ctx, HEART, 18, 1 + (Math.floor(t / 200) % 2), { o: '#E8596B' });
     if (fx === 'zzz') pat(ctx, ZZZ, 18, 3 - Math.floor(t / 700) % 3, { o: '#8A93B8' });
 
     const flash = a === 'evolve' && Math.floor(t / 120) % 2 === 0;
-    const imgSet = SPR.IMGS && SPR.IMGS[S.species];
+    const imgSet = SPR.IMGS && SPR.IMGS[P.species];
     const img = imgSet && (imgSet[expr] || imgSet.normal);
     if (img && img.complete && img.naturalWidth > 0) {
-      const scale = { baby: 0.66, child: 0.84, adult: 1.0 }[S.stage] || 1.0;
+      const scale = { baby: 0.66, child: 0.84, adult: 1.0 }[P.stage] || 1.0;
       const dw = Math.round(96 * scale), dh = Math.round(108 * scale);
       const groundY = (OY + 23) * SC + 2;
       const drawY = groundY - dh + dy * SC;
@@ -435,28 +487,28 @@
   }
 
   function drawPet(t) {
-    const sp = SPR.SPR[S.species][S.stage], meta = SPR.META[S.species], st = S.stats, work = isWork();
+    const sp = SPR.SPR[P.species][P.stage], meta = SPR.META[P.species], st = P.stats, work = isWork();
     const a = (anim.type && t < anim.until) ? anim.type : null;
-    if (S.gfx !== 'pixel' && SPR.IMGS && SPR.IMGS[S.species]) {
+    if (S.gfx !== 'pixel' && SPR.IMGS && SPR.IMGS[P.species]) {
       drawPetImage(t, sp, st, work, a);
       return;
     }
     let eyes = 'open', mouth = 'smile', dy = 0, fx = null, feet = 'stand', fo = 0, laptop = false;
     if (dragging) { eyes = 'open'; mouth = 'o'; feet = 'dangle'; }
-    else if (!work || S.sleeping) { eyes = 'sleep'; mouth = 'flat'; dy = (Math.floor(t / 1100) % 2) ? 1 : 0; fx = 'zzz'; feet = 'none'; }
+    else if (!work || P.sleeping) { eyes = 'sleep'; mouth = 'flat'; dy = (Math.floor(t / 1100) % 2) ? 1 : 0; fx = 'zzz'; feet = 'none'; }
     else if (a === 'joy' || a === 'play') { eyes = 'joy'; mouth = 'open'; const q = [0, -1, -3, -4, -3, -1]; dy = q[Math.floor(t / 85) % q.length]; fx = a === 'play' ? 'ball' : 'heart'; }
     else if (a === 'eat') { mouth = (Math.floor(t / 180) % 2) ? 'open' : 'flat'; fx = 'rice'; dy = (Math.floor(t / 180) % 2) ? 0 : -1; }
     else if (S.pomo.state === 'focus') { mouth = 'flat'; laptop = true; feet = 'none'; if ((t % 7000) < 900) fx = 'drop'; }
     else if (st.full < 30) { eyes = 'teary'; mouth = 'wavy'; dy = 1; fx = 'drop'; }
     else if (st.energy < 25) { eyes = 'tired'; mouth = 'flat'; dy = 1; }
     else if (st.mood < 30) { mouth = 'frown'; }
-    else if (walking) { feet = 'walk'; dy = (Math.floor(t / 160) % 2) ? -1 : 0; fo = S.stage === 'baby' ? 0 : beh.dir; }
+    else if (walking) { feet = 'walk'; dy = (Math.floor(t / 160) % 2) ? -1 : 0; fo = P.stage === 'baby' ? 0 : beh.dir; }
     else {
       dy = (Math.floor(t / 600) % 2) ? 0 : -1;
-      if (beh.s === 'look' && S.stage !== 'baby') fo = (Math.floor(t / 900) % 2) ? 1 : -1;
+      if (beh.s === 'look' && P.stage !== 'baby') fo = (Math.floor(t / 900) % 2) ? 1 : -1;
       if (st.mood > 75 && (t % 5000) < 700) eyes = 'joy';
     }
-    const sw = { baby: 4, child: 5, adult: 6 }[S.stage];
+    const sw = { baby: 4, child: 5, adult: 6 }[P.stage];
     shadow(dy < -2 ? sw - 2 : sw);
     if (fx === 'heart') pat(ctx, HEART, 18, 1 + (Math.floor(t / 200) % 2), { o: '#E8596B' });
     if (fx === 'zzz') pat(ctx, ZZZ, 18, 3 - Math.floor(t / 700) % 3, { o: '#8A93B8' });
@@ -472,7 +524,7 @@
     [E.l + fo, E.r + fo].forEach(x0 => {
       const y0 = E.y + Y, yb = y0 + E.h - 1;
       if (eyes === 'joy') { px(ctx, x0, y0 + 1, ink); px(ctx, x0 + 1, y0 + 1, ink); px(ctx, x0 - 1, y0 + 2, ink); px(ctx, x0 + 2, y0 + 2, ink); }
-      else if (eyes === 'sleep') { px(ctx, x0 - 1, yb - 1, ink); px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); px(ctx, x0 + 2, yb-1, ink); }
+      else if (eyes === 'sleep') { px(ctx, x0 - 1, yb - 1, ink); px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); px(ctx, x0 + 2, yb - 1, ink); }
       else if (blink) { px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); }
       else if (eyes === 'tired') { px(ctx, x0 - 1, yb - 1, ink); px(ctx, x0, yb - 1, ink); px(ctx, x0 + 1, yb - 1, ink); px(ctx, x0 + 2, yb - 1, ink); px(ctx, x0, yb, ink); px(ctx, x0 + 1, yb, ink); }
       else {
@@ -518,8 +570,8 @@
   /* ===== 걷기 ===== */
   let beh = { s: 'idle', until: 0, dir: 1 }, walkAcc = 0, walkBusy = false, walking = false, lastT = 0;
   function canWalk(t) {
-    return S.mode === 'walk' && S.stage !== 'egg' && isWork() && !S.sleeping && S.pomo.state !== 'focus' &&
-      !panelOpen && !dragging && !(anim.type && t < anim.until) && S.stats.energy >= 25 && S.stats.full >= 30;
+    return S.mode === 'walk' && P.stage !== 'egg' && isWork() && !P.sleeping && S.pomo.state !== 'focus' &&
+      !panelOpen && !dragging && !(anim.type && t < anim.until) && P.stats.energy >= 25 && P.stats.full >= 30;
   }
   function behave(t, dt) {
     if (!canWalk(t)) { walking = false; if (beh.s === 'walk') beh.s = 'idle'; return; }
@@ -529,7 +581,7 @@
     }
     walking = beh.s === 'walk';
     if (!walking) return;
-    walkAcc += beh.dir * CFG.SPEED[S.stage] * dt / 1000;
+    walkAcc += beh.dir * CFG.SPEED[P.stage] * dt / 1000;
     const step = Math.trunc(walkAcc);
     if (step !== 0 && !walkBusy) {
       walkAcc -= step; walkBusy = true;
@@ -544,10 +596,10 @@
 
   function loop(t) {
     const dt = Math.min(100, t - (lastT || t)); lastT = t;
-    if (S) {
+    if (S && P) {
       behave(t, dt);
       ctx.clearRect(0, 0, cv.width, cv.height);
-      if (S.stage === 'egg') drawEgg(t); else drawPet(t);
+      if (P.stage === 'egg') drawEgg(t); else drawPet(t);
     }
     requestAnimationFrame(loop);
   }
@@ -558,14 +610,14 @@
   function bar(label, v) { const n = Math.round(v); return '<div class="lbl"><span>' + label + '</span><span>' + n + '</span></div><div class="bar"><i class="' + (n < 30 ? 'low' : '') + '" style="width:' + n + '%"></i></div>'; }
   const VIEWS = {
     hatch() {
-      const hm = S.egg.hatchMode || 'random';
+      const hm = P.egg.hatchMode || 'random';
       const tg = (m, txt) => '<button class="toggle' + (hm === m ? ' on' : '') + '" data-hm="' + m + '">' + txt + '</button>';
-      let h = '<div class="lbl"><span>부화 방식을 골라줘</span></div>';
+      let h = '<div class="lbl"><span>' + (S.active + 1) + '번 슬롯 부화 방식을 골라줘</span></div>';
       h += '<div class="row">' + tg('random', '🎲 랜덤') + tg('select', '🎯 직접 선택') + tg('care', '🌱 돌봄 성향') + '</div>';
       if (hm === 'select') {
         h += '<div class="sub note">태어날 치이카와 친구를 선택해줘:</div><div class="pick-grid">';
         SPR.ORDER.forEach(k => {
-          const on = S.egg.target === k;
+          const on = P.egg.target === k;
           h += '<div class="pick-card' + (on ? ' on' : '') + '" data-pick="' + k + '"><canvas width="48" height="54" data-sp="' + k + '" data-open="1"></canvas><span>' + SPR.META[k].name + '</span></div>';
         });
         h += '</div>';
@@ -579,18 +631,19 @@
     },
     status() {
       const dis = isWork() ? '' : 'disabled'; let h = '';
-      if (S.stage === 'egg') {
-        h += bar('부화까지', Math.min(100, S.egg.prog / CFG.STAGE_MIN.egg * 100));
-        h += '<div class="sub">' + SPR.HINT[eggHint()] + ' · <b>' + esc(hatchModeLabel()) + '</b></div>';
+      if (P.stage === 'egg') {
+        h += bar('부화까지', Math.min(100, P.egg.prog / CFG.STAGE_MIN.egg * 100));
+        h += '<div class="sub">' + SPR.HINT[eggHint(P)] + ' · <b>' + esc(hatchModeLabel(P)) + '</b></div>';
         h += '<div class="row"><button data-a="feed" ' + dis + '>밥주기</button><button data-a="play" ' + dis + '>놀아주기</button><button data-a="rest" ' + dis + '>덮어주기</button></div>';
         h += '<div class="row"><button data-a="openHatch">부화 방식 · 캐릭터 변경</button><button data-a="hatchNow">바로 깨우기</button></div>';
       } else {
-        const st = S.stats;
-        if (S.stage !== 'adult') h += bar(S.stage === 'baby' ? '어린이까지' : '어른까지', Math.min(100, S.stageMin / CFG.STAGE_MIN[S.stage] * 100));
+        const st = P.stats;
+        if (P.stage !== 'adult') h += bar(P.stage === 'baby' ? '어린이까지' : '어른까지', Math.min(100, P.stageMin / CFG.STAGE_MIN[P.stage] * 100));
         h += bar('배부름', st.full) + bar('기분', st.mood) + bar('기운', st.energy);
-        h += '<div class="row"><button data-a="feed" ' + dis + '>밥주기</button><button data-a="play" ' + dis + '>놀아주기</button><button data-a="rest" ' + dis + '>' + (S.sleeping ? '깨우기' : '재우기') + '</button></div>';
-        if (S.stage === 'adult') h += '<div class="row"><button class="pri" data-a="newegg">새 알 받기 (다른 친구 키우기)</button></div>';
+        h += '<div class="row"><button data-a="feed" ' + dis + '>밥주기</button><button data-a="play" ' + dis + '>놀아주기</button><button data-a="rest" ' + dis + '>' + (P.sleeping ? '깨우기' : '재우기') + '</button></div>';
+        if (P.stage === 'adult') h += '<div class="row"><button class="pri" data-a="newegg">이 슬롯에 새 알 받기</button></div>';
       }
+      h += '<div class="sub note">상단 ①·②·③ 버튼으로 3마리까지 번갈아 키울 수 있어 (쉬는 슬롯은 시간이 멈춰서 배고파지지 않아)</div>';
       if (!isWork()) h += '<div class="sub note">지금은 쉬는 시간이라 시간이 멈춰 있어 (평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시 · 설정에서 빠른 모드를 켜면 바로 플레이 가능)</div>';
       return h;
     },
@@ -598,7 +651,7 @@
       let h = '<div class="todo-add"><input id="todoIn" maxlength="60" placeholder="할 일 입력 후 Enter"><button data-a="todoAdd">추가</button></div><ul class="todos">';
       if (!S.todos.length) h += '<li class="sub" style="border:none">아직 할 일이 없어</li>';
       S.todos.forEach(x => { h += '<li class="' + (x.done ? 'done' : '') + '"><label><input type="checkbox" data-t="' + x.id + '"' + (x.done ? ' checked' : '') + '><span title="' + esc(x.t) + '">' + esc(x.t) + '</span></label><button class="ic" data-del="' + x.id + '" title="삭제">×</button></li>'; });
-      h += '</ul><div class="sub note">완료하면 펫 기분이 올라가. 완료한 항목은 다음 날 자동 정리 · 오늘 완료 ' + S.daily.todo + '개</div>';
+      h += '</ul><div class="sub note">완료하면 현재 나와 있는 펫 기분이 올라가 · 오늘 완료 ' + S.daily.todo + '개</div>';
       return h;
     },
     pomo() {
@@ -606,7 +659,7 @@
       const label = { idle: '대기 중', focus: '집중 중 — 펫도 같이 일하는 중', break: '쉬는 시간' }[p.state];
       let h = '<div class="pomo"><div class="big" id="pomoT">' + mmss(left) + '</div><div class="sub" id="pomoL">' + label + '</div></div>';
       h += '<div class="row">' + (p.state === 'idle' ? '<button data-a="pomoStart">집중 시작 (' + CFG.POMO.focus + '분)</button>' : '<button data-a="pomoStop">멈추기</button>') + '</div>';
-      h += '<div class="sub note">끝까지 집중하면 펫 기분이 크게 올라가 · 오늘 ' + S.daily.pomo + '회 / 누적 ' + S.count.pomo + '회</div>';
+      h += '<div class="sub note">끝까지 집중하면 현재 펫 기분이 크게 올라가 · 오늘 ' + S.daily.pomo + '회 / 누적 ' + S.count.pomo + '회</div>';
       return h;
     },
     dex() {
@@ -627,18 +680,27 @@
       h += '<div class="lbl" style="margin-top:6px">프로그램</div><div class="row">' + tg('autostart', autostart, '자동 실행 ' + (autostart ? '켜짐' : '꺼짐')) + '<button data-a="update">업데이트 확인</button></div>';
       h += '<div class="sub note">근무시간 평일 ' + CFG.WORK_START + '~' + CFG.WORK_END + '시 · 숨기기 Esc / Ctrl+Alt+P · 버전 ' + esc(version) + '</div>';
       if (confirmBox === 'reset') {
-        h += '<div class="row"><button class="pri" data-a="resetYes">정말 초기화할래</button><button data-a="confirmCancel">취소</button></div>';
+        h += '<div class="row"><button class="pri" data-a="resetYes">3슬롯·도감 전부 초기화</button><button data-a="confirmCancel">취소</button></div>';
+      } else if (confirmBox === 'newegg') {
+        h += '<div class="row"><button class="pri" data-a="neweggYes">' + (S.active + 1) + '번 슬롯 새 알 받기</button><button data-a="confirmCancel">취소</button></div>';
       } else {
-        h += '<div class="row"><button data-a="newegg">새 알 받기</button><button data-a="reset">처음부터 다시</button></div>';
+        h += '<div class="row"><button data-a="neweggAsk">현재 슬롯 새 알</button><button data-a="reset">전체 초기화</button></div>';
       }
       return h;
     }
   };
   function renderPanel() {
     if (!panelOpen) return;
-    const title = S.stage === 'egg' ? '알 (' + hatchModeLabel() + ')' : SPR.META[S.species].name + ' · ' + STAGE_KO[S.stage];
+    const title = P.stage === 'egg' ? '알 (' + hatchModeLabel(P) + ')' : SPR.META[P.species].name + ' · ' + STAGE_KO[P.stage];
+    const slotBtns = [0, 1, 2].map(i => {
+      const s = S.slots[i];
+      const on = i === S.active;
+      const empty = !s;
+      const tip = (i + 1) + '번 슬롯: ' + (s ? (s.stage === 'egg' ? '알' : SPR.META[s.species].name + ' (' + STAGE_KO[s.stage] + ')') : '빈 슬롯 (클릭 시 새 알)');
+      return '<button class="ic slot' + (on ? ' on' : '') + (empty ? ' empty' : '') + '" data-slot="' + i + '" title="' + esc(tip) + '">' + (i + 1) + '</button>';
+    }).join('');
     const tabs = [['status', '상태'], ['todo', '할 일'], ['pomo', '집중'], ['dex', '도감'], ['cfg', '설정']];
-    let h = '<div class="ph"><div><b>' + title + '</b><div class="sub" id="leave">' + leaveText() + '</div></div><div class="ph-btns"><button class="ic" data-a="hide" title="숨기기 (Esc)">–</button><button class="ic" data-a="close" title="닫기">×</button></div></div>';
+    let h = '<div class="ph"><div><b>' + title + '</b><div class="sub" id="leave">' + leaveText() + '</div></div><div class="ph-btns">' + slotBtns + '<span class="slot-sep"></span><button class="ic" data-a="hide" title="숨기기 (Esc)">–</button><button class="ic" data-a="close" title="닫기">×</button></div></div>';
     h += '<div class="tabs">' + tabs.map(([k, l]) => '<button class="tab' + ((view === k || (view === 'hatch' && k === 'status')) ? ' on' : '') + '" data-v="' + k + '">' + l + '</button>').join('') + '</div>';
     h += '<div class="body">' + (VIEWS[view] ? VIEWS[view]() : VIEWS.status()) + '</div><div class="pmsg" id="pmsg">' + esc(lastMsgShown ? lastMsg : '') + '</div>';
     panel.innerHTML = h;
@@ -668,21 +730,22 @@
   panel.addEventListener('click', async e => {
     const pick = e.target.closest('[data-pick]');
     if (pick) {
-      S.egg.hatchMode = 'select';
-      S.egg.target = pick.dataset.pick;
+      P.egg.hatchMode = 'select';
+      P.egg.target = pick.dataset.pick;
       lastMsgShown = true;
-      say(SPR.META[S.egg.target].name + ' 알을 선택했어!');
+      say(SPR.META[P.egg.target].name + ' 알을 선택했어!');
       save(); renderPanel(); return;
     }
     const hmBtn = e.target.closest('[data-hm]');
     if (hmBtn) {
-      S.egg.hatchMode = hmBtn.dataset.hm;
+      P.egg.hatchMode = hmBtn.dataset.hm;
       lastMsgShown = true;
-      say('부화 방식: ' + hatchModeLabel());
+      say('부화 방식: ' + hatchModeLabel(P));
       save(); renderPanel(); return;
     }
     const b = e.target.closest('button'); if (!b) return;
     lastMsgShown = true;
+    if (b.dataset.slot != null) { switchSlot(+b.dataset.slot); return; }
     if (b.dataset.v) { confirmBox = null; view = b.dataset.v; renderPanel(); if (view === 'todo') { const i = document.getElementById('todoIn'); if (i) i.focus(); } return; }
     if (b.dataset.del) { delTodo(b.dataset.del); renderPanel(); return; }
     const a = b.dataset.a;
@@ -690,7 +753,7 @@
     else if (a === 'close') closePanel();
     else if (a === 'hide') { closePanel(); api.hide(); }
     else if (a === 'openHatch') { view = 'hatch'; renderPanel(); }
-    else if (a === 'hatchDone') { view = 'status'; say('부화 설정 완료! ' + hatchModeLabel()); save(); renderPanel(); }
+    else if (a === 'hatchDone') { view = 'status'; say('부화 설정 완료! ' + hatchModeLabel(P)); save(); renderPanel(); }
     else if (a === 'hatchNow') { startHatch(true); }
     else if (a === 'todoAdd') { const i = document.getElementById('todoIn'); if (addTodo(i.value)) { renderPanel(); const n = document.getElementById('todoIn'); if (n) n.focus(); } }
     else if (a === 'pomoStart') { pomoStart(); renderPanel(); }
@@ -702,19 +765,23 @@
     else if (a === 'fast') { S.fast = !S.fast; S.last = Date.now(); say(S.fast ? '빠른 모드 켜짐' : '빠른 모드 꺼짐'); save(); renderPanel(); }
     else if (a === 'autostart') { autostart = await api.setAutostart(!autostart); say(autostart ? '윈도우 켤 때 같이 켜질게' : '자동 실행 껐어'); renderPanel(); }
     else if (a === 'update') { api.checkUpdate(); say('업데이트 확인 중…'); }
-    else if (a === 'newegg') {
-      const keep = { dex: S.dex, mode: S.mode, gfx: S.gfx, fast: S.fast, todos: S.todos, count: S.count, daily: S.daily, dayOff: S.dayOff, pomo: S.pomo };
-      const hm = S.egg ? S.egg.hatchMode : 'random';
-      const tgt = S.egg ? S.egg.target : 'chiikawa';
-      S = Object.assign(fresh(), keep, { egg: freshEgg(hm, tgt) });
-      save(); view = 'hatch'; renderPanel(); say('새 알을 받았어! 부화 방식을 골라줘');
+    else if (a === 'neweggAsk') { confirmBox = 'newegg'; renderPanel(); }
+    else if (a === 'newegg' || a === 'neweggYes') {
+      const hm = P.egg ? P.egg.hatchMode : 'random';
+      const tgt = P.egg ? P.egg.target : 'chiikawa';
+      S.slots[S.active] = freshPet(hm, tgt);
+      usePet(); confirmBox = null;
+      save(); view = 'hatch'; renderPanel();
+      say((S.active + 1) + '번 슬롯에 새 알을 받았어! 부화 방식을 골라줘');
     }
     else if (a === 'reset') { confirmBox = 'reset'; renderPanel(); }
     else if (a === 'confirmCancel') { confirmBox = null; renderPanel(); }
     else if (a === 'resetYes') {
       const mode = S.mode, gfx = S.gfx;
-      S = fresh(); S.mode = mode; S.gfx = gfx; confirmBox = null;
-      save(); view = 'hatch'; renderPanel(); say('처음부터 다시 시작! 부화 방식을 골라줘');
+      S = fresh(); S.mode = mode; S.gfx = gfx;
+      usePet(); confirmBox = null;
+      save(); view = 'hatch'; renderPanel();
+      say('처음부터 다시 시작! 부화 방식을 골라줘');
     }
   });
   panel.addEventListener('change', e => {
@@ -769,6 +836,7 @@
     let d = null; try { d = await api.load(); } catch (e) { }
     const first = !d;
     S = first ? fresh() : migrateSave(d);
+    usePet();
     rollDaily();
     try { autostart = await api.getAutostart(); version = await api.version(); } catch (e) { }
     api.setMode(S.mode); api.setIgnore(true);
@@ -779,10 +847,10 @@
     if (first) {
       setTimeout(() => {
         openPanel('hatch');
-        say('반가워! 먼저 알 부화 방식(랜덤/직접 선택)을 골라줘', 5500);
+        say('반가워! 1번 슬롯의 알 부화 방식(랜덤/직접 선택)을 골라줘', 5500);
       }, 400);
     }
-    else if (!isWork()) setTimeout(() => say(S.stage === 'egg' ? '알도 쉬는 중… zZ' : offReason()), 500);
-    else setTimeout(() => say(S.stage === 'egg' ? '좋은 아침!' : ['출근했어? 좋은 아침!', '오늘도 같이 힘내자!', '왔구나! 반가워~'][Math.floor(Math.random() * 3)]), 500);
+    else if (!isWork()) setTimeout(() => say(P.stage === 'egg' ? '알도 쉬는 중… zZ' : offReason()), 500);
+    else setTimeout(() => say(P.stage === 'egg' ? '좋은 아침!' : ['출근했어? 좋은 아침!', '오늘도 같이 힘내자!', '왔구나! 반가워~'][Math.floor(Math.random() * 3)]), 500);
   })();
 })();
