@@ -96,7 +96,16 @@ function setupUpdater() {
     autoUpdater.autoInstallOnAppQuit = true;
     autoUpdater.on('update-available', i => { if (manualCheck) send('msg', '새 버전 ' + i.version + ' 받는 중…'); });
     autoUpdater.on('update-not-available', () => { if (manualCheck) send('msg', '지금이 최신 버전이야 (' + app.getVersion() + ')'); manualCheck = false; });
-    autoUpdater.on('update-downloaded', i => { send('update', i.version); manualCheck = false; });
+    autoUpdater.on('update-downloaded', i => {
+      send('msg', '새 버전 ' + i.version + ' 준비 완료! 3초 뒤 자동으로 재시작해서 적용할게');
+      manualCheck = false;
+      send('flush');
+      setTimeout(() => {
+        quitting = true;
+        if (win && !win.isDestroyed()) win.destroy();
+        autoUpdater.quitAndInstall(false, true);
+      }, 3000);
+    });
     autoUpdater.on('error', () => { if (manualCheck) send('msg', '업데이트 확인 실패 (인터넷 또는 배포 설정 확인)'); manualCheck = false; });
     updater = autoUpdater;
     setTimeout(() => checkUpdate(false), 8000);
