@@ -1,8 +1,8 @@
 {
   "name": "office-pet",
   "productName": "OfficePet",
-  "version": "0.3.0",
-  "description": "사무실 펫 - 업무시간에 같이 지내는 도트 펫",
+  "version": "0.4.0",
+  "description": "사무실 펫 (치이카와 7종 에디션) - 업무시간에 같이 지내는 도트 펫",
   "author": "동훈",
   "main": "main.js",
   "scripts": {
